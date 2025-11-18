@@ -19,6 +19,7 @@ class Ticket(BaseModel):
     status: str = Field("open", description="open | pending | closed")
     priority: str = Field("medium", description="low | medium | high")
     assignee: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
     messages: List[TicketMessage] = Field(default_factory=list)
 
 class TicketReply(BaseModel):
@@ -26,6 +27,23 @@ class TicketReply(BaseModel):
     author_email: EmailStr
     body: str
     send_email: bool = True
+
+# Auth & Users
+class UserCreate(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    role: str = Field("agent", description="agent | admin")
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserOut(BaseModel):
+    id: str
+    name: str
+    email: EmailStr
+    role: str
 
 # Simple auth schema if needed in the future
 class AuthContext(BaseModel):

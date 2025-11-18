@@ -1,15 +1,16 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Path, Query, Header, Depends
+from fastapi import FastAPI, HTTPException, Path, Query, Header, Depends, Response, Cookie
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from bson import ObjectId
 import requests
+import bcrypt
 
 from database import db, create_document, get_documents
-from schemas import Ticket, TicketReply
+from schemas import Ticket, TicketReply, UserCreate, UserLogin, UserOut
 
 app = FastAPI(title="Ticket Desk API")
 
@@ -18,7 +19,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 
@@ -121,6 +122,182 @@ def send_email(to_email: str, subject: str, body: str) -> bool:
         return False
 
 
+# ---------------- Session Auth (tenant-aware) ----------------
+SESSION_COOKIE = "session"
+SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "43200"))  # 30 days
+
+
+def hash_password(password: str) -> bytes:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+
+
+def verify_password(password: str, hashed: bytes) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), hashed)
+    except Exception:
+        return False
+
+
+class SessionUser(BaseModel):
+    id: str
+    name: str
+    email: EmailStr
+    role: str
+    company_id: str
+
+
+def get_session_user(
+    session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> Optional[SessionUser]:
+    sid = None
+    if session:
+        sid = session
+    # Support Authorization: Bearer <sid>
+    if authorization and authorization.lower().startswith("bearer "):
+        sid = authorization.split(" ", 1)[1].strip()
+    if not sid:
+        return None
+    sdoc = db["session"].find_one({"_id": sid})
+    if not sdoc:
+        return None
+    # Expiry check
+    if sdoc.get("expires_at") and sdoc["expires_at"] < datetime.now(timezone.utc):
+        db["session"].delete_one({"_id": sid})
+        return None
+    return SessionUser(**sdoc["user"])
+
+
+def require_user(user: Optional[SessionUser] = Depends(get_session_user)) -> SessionUser:
+    if not user:
+        raise HTTPException(401, "Not authenticated")
+    return user
+
+
+def require_admin(user: SessionUser = Depends(require_user)) -> SessionUser:
+    if user.role != "admin":
+        raise HTTPException(403, "Admin only")
+    return user
+
+
+# ---------------- Users (company-scoped) ----------------
+@app.post("/api/auth/bootstrap_admin")
+def bootstrap_admin(payload: UserCreate, company: CompanyCtx = Depends(get_company)):
+    # Only allowed if company has no users yet
+    existing = db["user"].count_documents({"company_id": company.id})
+    if existing > 0:
+        raise HTTPException(400, "Admin already exists; use register via admin")
+    if payload.role not in {"agent", "admin"}:
+        raise HTTPException(400, "Invalid role")
+    doc = {
+        "company_id": company.id,
+        "name": payload.name,
+        "email": payload.email,
+        "role": "admin",  # force admin on bootstrap
+        "password_hash": hash_password(payload.password),
+        "created_at": datetime.now(timezone.utc),
+    }
+    uid = create_document("user", doc)
+    return {"id": uid}
+
+
+@app.post("/api/auth/register")
+def register_user(payload: UserCreate, company: CompanyCtx = Depends(get_company), admin: SessionUser = Depends(require_admin)):
+    if payload.role not in {"agent", "admin"}:
+        raise HTTPException(400, "Invalid role")
+    # Enforce company scope and unique email per company
+    if db["user"].find_one({"email": payload.email, "company_id": company.id}):
+        raise HTTPException(400, "Email already registered for this company")
+    doc = {
+        "company_id": company.id,
+        "name": payload.name,
+        "email": payload.email,
+        "role": payload.role,
+        "password_hash": hash_password(payload.password),
+        "created_at": datetime.now(timezone.utc),
+    }
+    uid = create_document("user", doc)
+    return {"id": uid}
+
+
+@app.post("/api/auth/login")
+def login_user(payload: UserLogin, response: Response, company: CompanyCtx = Depends(get_company)):
+    user = db["user"].find_one({"email": payload.email, "company_id": company.id})
+    if not user or not verify_password(payload.password, user.get("password_hash", b"")):
+        raise HTTPException(401, "Invalid credentials")
+    # Create session
+    sid = os.urandom(24).hex()
+    expires = datetime.now(timezone.utc) + timedelta(minutes=SESSION_TTL_MINUTES)
+    sess = {
+        "_id": sid,
+        "user": {
+            "id": str(user["_id"]),
+            "name": user["name"],
+            "email": user["email"],
+            "role": user["role"],
+            "company_id": user["company_id"],
+        },
+        "company_id": user["company_id"],
+        "created_at": datetime.now(timezone.utc),
+        "expires_at": expires,
+    }
+    db["session"].insert_one(sess)
+    # HttpOnly cookie (may be ignored cross-origin)
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=sid,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=SESSION_TTL_MINUTES * 60,
+        path="/",
+    )
+    return {"ok": True, "session": sid}
+
+
+@app.post("/api/auth/logout")
+def logout_user(response: Response, session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
+    sid = session
+    if sid:
+        db["session"].delete_one({"_id": sid})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def get_me(user: SessionUser = Depends(require_user)):
+    return user
+
+
+class RolePatch(BaseModel):
+    role: str
+
+
+@app.get("/api/users")
+def list_users(company: CompanyCtx = Depends(get_company), admin: SessionUser = Depends(require_admin)):
+    items = list(db["user"].find({"company_id": company.id}).limit(200))
+    out: List[UserOut] = []  # type: ignore
+    for u in items:
+        out.append(UserOut(id=str(u["_id"]), name=u["name"], email=u["email"], role=u["role"]))
+    return {"items": [o.model_dump() for o in out]}
+
+
+@app.patch("/api/users/{user_id}/role")
+def change_role(user_id: str, patch: RolePatch, company: CompanyCtx = Depends(get_company), admin: SessionUser = Depends(require_admin)):
+    if patch.role not in {"agent", "admin"}:
+        raise HTTPException(400, "Invalid role")
+    res = db["user"].update_one({"_id": oid(user_id), "company_id": company.id}, {"$set": {"role": patch.role}})
+    if res.matched_count == 0:
+        raise HTTPException(404, "User not found")
+    return {"ok": True}
+
+
+@app.delete("/api/users/{user_id}")
+def delete_user(user_id: str, company: CompanyCtx = Depends(get_company), admin: SessionUser = Depends(require_admin)):
+    res = db["user"].delete_one({"_id": oid(user_id), "company_id": company.id})
+    return {"deleted": res.deleted_count}
+
+
 # ---------------- Ticket Endpoints ----------------
 @app.post("/api/tickets")
 def create_ticket(ticket: Ticket, company: CompanyCtx = Depends(get_company)):
@@ -143,12 +320,22 @@ def create_ticket(ticket: Ticket, company: CompanyCtx = Depends(get_company)):
 @app.get("/api/tickets")
 def list_tickets(
     status: Optional[str] = Query(None),
+    q: Optional[str] = Query(None, description="full-text search"),
     limit: int = Query(50, ge=1, le=200),
     company: CompanyCtx = Depends(get_company),
 ):
     filt: Dict[str, Any] = {"company_id": company.id}
     if status:
         filt["status"] = status
+    # Search by subject, submitter, messages.body, tags
+    if q:
+        filt["$or"] = [
+            {"subject": {"$regex": q, "$options": "i"}},
+            {"submitter_name": {"$regex": q, "$options": "i"}},
+            {"submitter_email": {"$regex": q, "$options": "i"}},
+            {"messages.body": {"$regex": q, "$options": "i"}},
+            {"tags": {"$elemMatch": {"$regex": q, "$options": "i"}}},
+        ]
     items = get_documents("ticket", filt, limit)
     items = [serialize_ticket(d) for d in items]
     # Sort newest first by updated_at or created_at
@@ -234,6 +421,53 @@ def update_priority(ticket_id: str, patch: PriorityPatch, company: CompanyCtx = 
     if res.matched_count == 0:
         raise HTTPException(404, "Ticket not found")
     return {"ok": True}
+
+
+class TagsPatch(BaseModel):
+    tags: List[str]
+
+
+@app.patch("/api/tickets/{ticket_id}/tags")
+def update_tags(ticket_id: str, patch: TagsPatch, company: CompanyCtx = Depends(get_company)):
+    res = db["ticket"].update_one({"_id": oid(ticket_id), "company_id": company.id}, {
+        "$set": {"tags": patch.tags, "updated_at": datetime.now(timezone.utc)}
+    })
+    if res.matched_count == 0:
+        raise HTTPException(404, "Ticket not found")
+    return {"ok": True}
+
+
+class BulkAction(BaseModel):
+    ids: List[str]
+    action: str
+    value: Optional[str] = None
+
+
+@app.post("/api/tickets/bulk")
+def bulk_update(payload: BulkAction, company: CompanyCtx = Depends(get_company)):
+    if not payload.ids:
+        raise HTTPException(400, "No ids provided")
+    obj_ids = []
+    for i in payload.ids:
+        try:
+            obj_ids.append(oid(i))
+        except HTTPException:
+            continue
+    if not obj_ids:
+        return {"updated": 0}
+
+    update = {"$set": {"updated_at": datetime.now(timezone.utc)}}
+    if payload.action == "status" and payload.value in {"open", "pending", "closed"}:
+        update["$set"]["status"] = payload.value
+    elif payload.action == "priority" and payload.value in {"low", "medium", "high"}:
+        update["$set"]["priority"] = payload.value
+    elif payload.action == "assign":
+        update["$set"]["assignee"] = payload.value
+    else:
+        raise HTTPException(400, "Invalid action or value")
+
+    res = db["ticket"].update_many({"_id": {"$in": obj_ids}, "company_id": company.id}, update)
+    return {"updated": res.modified_count}
 
 
 # ---------------- Email Inbound Webhook ----------------
