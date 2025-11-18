@@ -11,7 +11,8 @@ class TicketMessage(BaseModel):
     created_at: Optional[str] = Field(default=None, description="ISO timestamp")
 
 class Ticket(BaseModel):
-    company_id: str = Field(..., description="Tenant/company identifier")
+    # Make company_id optional for create flows; backend will set it from session
+    company_id: Optional[str] = Field(default=None, description="Tenant/company identifier")
     submitter_name: str
     submitter_email: EmailStr
     subject: str

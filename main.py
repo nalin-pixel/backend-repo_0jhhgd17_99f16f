@@ -252,8 +252,16 @@ def login_user(payload: UserLogin, response: Response):
 
 
 @app.post("/api/auth/logout")
-def logout_user(response: Response, session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE)):
-    sid = session
+def logout_user(
+    response: Response,
+    session: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+):
+    sid = None
+    if session:
+        sid = session
+    if authorization and authorization.lower().startswith("bearer "):
+        sid = authorization.split(" ", 1)[1].strip()
     if sid:
         db["session"].delete_one({"_id": sid})
     response.delete_cookie(SESSION_COOKIE, path="/")
