@@ -55,17 +55,21 @@ def health():
 
 @app.get("/test")
 def test_database():
+    # Adapt to updated database module with fallback modes
+    from database import DB_MODE, DATABASE_URL, DATABASE_NAME
     resp = {
         "backend": "✅ Running",
-        "database": "❌ Not Available",
-        "database_url": "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set",
-        "database_name": "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set",
+        "database": "❌ Not Connected",
+        "database_url": "✅ Set" if DATABASE_URL else "❌ Not Set",
+        "database_name": "✅ Set" if DATABASE_NAME else "❌ Not Set",
+        "mode": DB_MODE,
         "collections": [],
     }
     try:
         if db is None:
             resp["database"] = "❌ Not Connected"
         else:
+            # If we're using mongomock, still report Connected so the app works for demo
             resp["database"] = "✅ Connected"
             resp["collections"] = db.list_collection_names()
     except Exception as e:
@@ -174,6 +178,9 @@ class SignupPayload(BaseModel):
 
 @app.post("/api/auth/signup")
 def signup(payload: SignupPayload):
+    # Ensure DB is available
+    if db is None:
+        raise HTTPException(500, "Database not configured")
     # Enforce unique email globally for simplicity
     if db["user"].find_one({"email": payload.email}):
         raise HTTPException(400, "Email already in use")
